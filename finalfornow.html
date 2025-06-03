@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Tornado Tracker (Active + History only)</title>
+
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet/dist/leaflet.css"
+  />
+
+  <style>
+    /* A) Make the map container fill the entire viewport */
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      font-family: Arial, sans-serif;
+    }
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* B) “History” toggle button (top-right) */
+    #toggleHistoryBtn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 1001;
+      background: rgba(0,0,0,0.6);
+      color: white;
+      padding: 6px 12px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #toggleHistoryBtn:hover {
+      background: rgba(0,0,0,0.8);
+    }
+
+    /* C) History panel (hidden by default) */
+    #history {
+      display: none; /* start hidden */
+      position: absolute;
+      top: 50px;
+      right: 10px;
+      width: 300px;
+      max-height: 85vh;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 12px;
+      border-radius: 8px;
+      overflow-y: auto;
+      font-size: 13px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+      z-index: 1000;
+    }
+    #history header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      border-bottom: 1px solid #ccc;
+      padding-bottom: 4px;
+    }
+    #history header h3 {
+      margin: 0;
+      font-size: 16px;
+    }
+    #history header span {
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+    }
+    #history ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    #history li {
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #eee;
+    }
+    #history li:last-child {
+      border-bottom: none;
+    }
+    #history .event-type {
+      font-weight: bold;
+      font-size: 14px;
+    }
+    #history .area-desc {
+      font-style: italic;
+      font-size: 13px;
+      color: #0066cc;
+      cursor: pointer;
+      margin: 2px 0;
+    }
+    #history .time {
+      font-size: 12px;
+      color: #555;
+    }
+    #history a {
+      color: #0066cc;
+      text-decoration: none;
+      font-size: 12px;
+      display: block;
+      margin-top: 4px;
+    }
+    #history a:hover {
+      text-decoration: underline;
+    }
+
+    /* D) Popup button styles */
+    .popup-link {
+      display: inline-block;
+      margin: 4px 0;
+      padding: 6px 10px;
+      color: white;
+      text-decoration: none;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .popup-link.warning { background-color: #d32f2f; } /* red */
+    .popup-link.watch   { background-color: #1976d2; } /* blue */
+    .popup-link.local   { background-color: #388e3c; } /* green */
+    .popup-link:hover   { opacity: 0.85;      }
+  </style>
+</head>
+<body>
+  <!-- 2) Map container -->
+  <div id="map"></div>
+
+  <!-- 3) Button to toggle History panel -->
+  <button id="toggleHistoryBtn">History</button>
+
+  <!-- 4) History panel (starts hidden) -->
+  <div id="history">
+    <header>
+      <h3>Past 24 Hours Alerts</h3>
+      <span id="closeHistory">&times;</span>
+    </header>
+    <ul id="historyList">
+      <li>Loading…</li>
+    </ul>
+  </div>
+
+  <!-- 5) Leaflet JS (map library) -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <script>
+    // 6) Initialize the map centered on Oklahoma
+    const map = L.map('map').setView([35.5, -97.5], 6);
+
+    // OPTIONAL: Zoom to user’s GPS location if allowed
+    map.locate({ setView: true, maxZoom: 10 });
+
+    // 7) Add OpenStreetMap tile layer
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // 8) Create LayerGroups
+    const alertsLayer  = L.layerGroup().addTo(map);  // active warnings/watches
+    const historyLayer = L.layerGroup().addTo(map);  // highlight from history click
+
+    // 9) Helper: Draw GeoJSON (handles both Polygon & MultiPolygon)
+    function drawGeoJSON(geom, styleOpts, targetLayer) {
+      if (!geom) return null;
+      return L.geoJSON(geom, {
+        style: () => styleOpts
+      }).addTo(targetLayer);
+    }
+
+    // 10) Fetch active Tornado Warnings (red) & Watches (blue)
+    async function fetchTornadoAlerts() {
+      try {
+        alertsLayer.clearLayers();
+
+        const urls = {
+          warning: 'https://api.weather.gov/alerts/active?area=OK&event=Tornado%20Warning',
+          watch:   'https://api.weather.gov/alerts/active?area=OK&event=Tornado%20Watch'
+        };
+
+        const [warnResp, watchResp] = await Promise.all([
+          fetch(urls.warning),
+          fetch(urls.watch)
+        ]);
+        const warnData  = await warnResp.json();
+        const watchData = await watchResp.json();
+
+        // Draw Warnings (red)
+        if (Array.isArray(warnData.features)) {
+          warnData.features.forEach(feature => {
+            const geom = feature.geometry;
+            if (!geom) return;
+
+            // Draw with fillOpacity 0.4 & weight 2
+            const group = drawGeoJSON(geom, {
+              color: 'red',
+              weight: 2,
+              fillOpacity: 0.4
+            }, alertsLayer);
+
+            // Prepare popup content
+            const props    = feature.properties;
+            const areaDesc = props.areaDesc || 'Unknown area';
+            const summary  = props.description  || 'No details';
+            const nwsLink  = props.web         || '#';
+
+            const popupHtml = `
+              <b>🚨 Tornado Warning</b><br>
+              <b>Area:</b> ${areaDesc}<br><br>
+              <b>Details:</b> ${summary}<br><br>
+              <a class="popup-link warning" href="${nwsLink}" target="_blank">🌐 View NWS Details</a><br>
+              <a class="popup-link warning" href="https://www.youtube.com/results?search_query=${encodeURIComponent(areaDesc + ' tornado live')}" target="_blank">📺 Watch Live Coverage</a><br>
+              <a class="popup-link local" href="https://www.koco.com/nowcast" target="_blank">📰 View Local News</a>
+            `;
+            group.eachLayer(layer => layer.bindPopup(popupHtml));
+          });
+        }
+
+        // Draw Watches (blue)
+        if (Array.isArray(watchData.features)) {
+          watchData.features.forEach(feature => {
+            const geom = feature.geometry;
+            if (!geom) return;
+
+            const group = drawGeoJSON(geom, {
+              color: 'blue',
+              weight: 1,
+              dashArray: '4,4',
+              fillOpacity: 0.2
+            }, alertsLayer);
+
+            const props    = feature.properties;
+            const areaDesc = props.areaDesc || 'Unknown area';
+            const summary  = props.description  || 'No details';
+            const nwsLink  = props.web         || '#';
+
+            const popupHtml = `
+              <b>⚠️ Tornado Watch</b><br>
+              <b>Area:</b> ${areaDesc}<br><br>
+              <b>Details:</b> ${summary}<br><br>
+              <a class="popup-link watch" href="${nwsLink}" target="_blank">🌐 View NWS Details</a><br>
+              <a class="popup-link watch" href="https://www.youtube.com/results?search_query=${encodeURIComponent(areaDesc + ' tornado live')}" target="_blank">📺 Watch Live Coverage</a><br>
+              <a class="popup-link local" href="https://www.koco.com/nowcast" target="_blank">📰 View Local News</a>
+            `;
+            group.eachLayer(layer => layer.bindPopup(popupHtml));
+          });
+        }
+
+      } catch (err) {
+        console.error('Error fetching/parsing active alerts:', err);
+      }
+    }
+
+    // 11) Fetch History (last 24 hours) and make each entry clickable
+    async function fetchHistory() {
+      try {
+        const startTime = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const url       = `https://api.weather.gov/alerts?area=OK&start=${startTime}`;
+        const resp      = await fetch(url);
+        const data      = await resp.json();
+
+        if (Array.isArray(data.features)) {
+          const items = data.features
+            .filter(f => {
+              const ev = f.properties.event;
+              return ev === 'Tornado Warning' || ev === 'Tornado Watch';
+            })
+            .sort((a, b) => {
+              const tA = new Date(a.properties.effective || a.properties.sent).getTime();
+              const tB = new Date(b.properties.effective || b.properties.sent).getTime();
+              return tB - tA;
+            })
+            .map(f => ({
+              id:    f.id,  // NWS ID to fetch full geometry later
+              event: f.properties.event,
+              area:  f.properties.areaDesc || 'Unknown area',
+              time:  f.properties.effective || f.properties.sent || 'No time',
+              link:  f.properties.web || '#'
+            }));
+
+          const listEl = document.getElementById('historyList');
+          listEl.innerHTML = '';
+          if (items.length === 0) {
+            listEl.innerHTML = '<li>No Tornado alerts in the past 24 hours.</li>';
+          } else {
+            items.forEach(item => {
+              const li = document.createElement('li');
+              const dt = new Date(item.time);
+              const formatted = dt.toLocaleString('en-US', {
+                month: 'short', day: 'numeric',
+                hour: 'numeric', minute: '2-digit', hour12: true
+              });
+              li.innerHTML = `
+                <span class="event-type">${item.event}</span><br>
+                <span class="area-desc" data-id="${item.id}">${item.area}</span><br>
+                <span class="time">${formatted}</span><br>
+                <a href="${item.link}" target="_blank">View NWS Details</a>
+              `;
+              listEl.appendChild(li);
+            });
+
+            // Make each “area-desc” clickable to highlight on the map
+            document.querySelectorAll('#historyList .area-desc').forEach(span => {
+              span.addEventListener('click', () => {
+                const alertId = span.getAttribute('data-id');
+                highlightHistoryAlert(alertId);
+              });
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching/parsing history data:', err);
+        document.getElementById('historyList').innerHTML =
+          '<li>Error loading history.</li>';
+      }
+    }
+
+    // 12) When a history item is clicked, fetch its geometry & highlight
+    async function highlightHistoryAlert(alertId) {
+      try {
+        historyLayer.clearLayers();
+
+        const url  = `https://api.weather.gov/alerts/${alertId}`;
+        const resp = await fetch(url);
+        const data = await resp.json();
+        const geom = data.geometry;
+        if (!geom) {
+          alert('No geometry found for this alert.');
+          return;
+        }
+
+        // Draw it on historyLayer, color based on Warning/Watch
+        const isWarning = data.properties.event.includes('Warning');
+        const styleOpts = {
+          color: (isWarning ? 'red' : 'blue'),
+          weight: 3,
+          fillOpacity: (isWarning ? 0.4 : 0.2),
+          dashArray: (isWarning ? null : '4,4')
+        };
+        const layerGroup = drawGeoJSON(geom, styleOpts, historyLayer);
+
+        // Zoom to its bounds
+        const bounds = historyLayer.getBounds();
+        if (bounds.isValid()) {
+          map.fitBounds(bounds, { padding: [20, 20] });
+        }
+
+        // Bind popup to the first sub-layer
+        const props    = data.properties;
+        const areaDesc = props.areaDesc || 'Unknown area';
+        const summary  = props.description  || 'No details';
+        const nwsLink  = props.web         || '#';
+        const popupHtml = `
+          <b>${data.properties.event}</b><br>
+          <b>Area:</b> ${areaDesc}<br><br>
+          <b>Details:</b> ${summary}<br><br>
+          <a class="popup-link ${(isWarning ? 'warning' : 'watch')}" href="${nwsLink}" target="_blank">🌐 View NWS Details</a><br>
+          <a class="popup-link ${(isWarning ? 'warning' : 'watch')}" href="https://www.youtube.com/results?search_query=${encodeURIComponent(areaDesc + ' tornado live')}" target="_blank">📺 Watch Live Coverage</a><br>
+          <a class="popup-link local" href="https://www.koco.com/nowcast" target="_blank">📰 View Local News</a>
+        `;
+        layerGroup.eachLayer(layer => layer.bindPopup(popupHtml).openPopup());
+
+      } catch (err) {
+        console.error('Error fetching/parsing single history alert:', err);
+        alert('Could not load that alert’s geometry.');
+      }
+    }
+
+    // 13) Toggle “History” panel on/off
+    const toggleBtn  = document.getElementById('toggleHistoryBtn');
+    const historyDiv = document.getElementById('history');
+    const closeBtn   = document.getElementById('closeHistory');
+
+    toggleBtn.addEventListener('click', () => {
+      historyDiv.style.display = 'block';
+    });
+    closeBtn.addEventListener('click', () => {
+      historyDiv.style.display = 'none';
+    });
+
+    // 14) On page load, fetch both current alerts and history
+    fetchTornadoAlerts();
+    fetchHistory();
+
+    // 15) Auto‐refresh both layers & history every 60 seconds
+    setInterval(() => {
+      fetchTornadoAlerts();
+      fetchHistory();
+    }, 60000);
+  </script>
+</body>
+</html>
